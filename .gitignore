@@ -16,5 +16,6 @@ coverage/
 
 # Build
 /dist
+/demo-timeline
 /netlify
 /api-docs
