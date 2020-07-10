@@ -258,23 +258,33 @@ class MP4Remuxer {
     firstDTS = inputSamples[0].dts;
     lastDTS = inputSamples[inputSamples.length - 1].dts;
 
-    // check timestamp continuity accross consecutive fragments (this is to remove inter-fragment gap/hole)
-    let delta = firstDTS - nextAvcDts;
+    // check timestamp continuity across consecutive fragments (this is to remove inter-fragment gap/hole)
+    const delta = firstDTS - nextAvcDts;
     // if fragment are contiguous, detect hole/overlapping between fragments
     if (contiguous) {
-      if (delta) {
-        if (delta > 1) {
-          logger.log(`AVC: ${toMsFromMpegTsClock(delta, true)} ms hole between fragments detected,filling it`);
-        } else if (delta < -1) {
-          logger.log(`AVC: ${toMsFromMpegTsClock(-delta, true)} ms overlapping between fragments detected`);
-        }
-
-        // remove hole/gap : set DTS to next expected DTS
+      const foundHole = delta >= 90;
+      const foundOverlap = delta < -1;
+      if (foundHole || foundOverlap) {
         firstDTS = nextAvcDts;
-        inputSamples[0].dts = firstDTS;
-        // offset PTS as well, ensure that PTS is smaller or equal than new DTS
-        minPTS = Math.max(minPTS - delta, nextAvcDts);
-        inputSamples[0].pts = minPTS;
+        minPTS -= delta;
+        if (foundHole) {
+          logger.warn(`AVC: ${toMsFromMpegTsClock(delta, true)} ms hole between fragments detected,filling it`);
+
+          // Move first frame back to fill hole
+          inputSamples[0].dts = firstDTS;
+          inputSamples[0].pts = minPTS;
+        } else {
+          logger.warn(`AVC: ${toMsFromMpegTsClock(-delta, true)} ms overlapping between fragments detected`);
+
+          // Move overlapping frames up, while maintaining composition time
+          inputSamples.forEach(function (sample) {
+            const frameDelta = nextAvcDts - sample.dts;
+            if (frameDelta > 0) {
+              sample.dts += frameDelta;
+              sample.pts += frameDelta;
+            }
+          });
+        }
         logger.log(`Video: PTS/DTS adjusted: ${toMsFromMpegTsClock(minPTS, true)}/${toMsFromMpegTsClock(firstDTS, true)}, delta: ${toMsFromMpegTsClock(delta, true)} ms`);
       }
     }
@@ -503,9 +513,17 @@ class MP4Remuxer {
 
         // If we're overlapping by more than a duration, drop this sample
         if (delta <= -maxAudioFramesDrift * inputSampleDuration) {
-          logger.warn(`Dropping 1 audio frame @ ${toMsFromMpegTsClock(nextPts, true)} ms due to ${toMsFromMpegTsClock(delta, true)} ms overlap.`);
-          inputSamples.splice(i, 1);
-          // Don't touch nextPtsNorm or i
+          if (contiguous) {
+            logger.warn(`Dropping 1 audio frame @ ${toMsFromMpegTsClock(nextPts, true) / 1000}s due to ${toMsFromMpegTsClock(delta, true)} ms overlap.`);
+            inputSamples.splice(i, 1);
+            // Don't touch nextPtsNorm or i
+          } else {
+            // When changing qualities we can't trust that audio has been appended up to nextAudioPts
+            // Warn about the overlap but do not drop samples as that can introduce buffer gaps
+            logger.warn(`Audio frame @ ${toMsFromMpegTsClock(pts, true) / 1000}s overlaps nextAudioPts by ${toMsFromMpegTsClock(delta, true)} ms.`);
+            nextPts = pts + inputSampleDuration;
+            i++;
+          }
         } // eslint-disable-line brace-style
 
         // Insert missing frames if:
@@ -514,7 +532,7 @@ class MP4Remuxer {
         // 3: currentTime (aka nextPtsNorm) is not 0
         else if (delta >= maxAudioFramesDrift * inputSampleDuration && delta < MAX_SILENT_FRAME_DURATION_90KHZ && nextPts) {
           let missing = Math.round(delta / inputSampleDuration);
-          logger.warn(`Injecting ${missing} audio frames @ ${toMsFromMpegTsClock(nextPts, true)} ms due to ${toMsFromMpegTsClock(delta, true)} ms gap.`);
+          logger.warn(`Injecting ${missing} audio frames @ ${toMsFromMpegTsClock(nextPts, true) / 1000}s due to ${toMsFromMpegTsClock(delta, true)} ms gap.`);
           for (let j = 0; j < missing; j++) {
             let newStamp = Math.max(nextPts, 0);
             fillFrame = AAC.getSilentFrame(track.manifestCodec || track.codec, track.channelCount);
